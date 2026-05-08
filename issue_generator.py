@@ -13,7 +13,7 @@ import requests
 import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from github import Github
+from github import Github, GithubException
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,6 +40,18 @@ class IssueGenerator:
         """Initialize the issue generator with GitHub credentials."""
         self.github = Github(github_token)
         self.repo = self.github.get_repo(repo_name)
+        self._ensure_label("runtime", "0075ca", "Flatpak runtime update needed")
+
+    def _ensure_label(self, name: str, color: str, description: str = "") -> None:
+        """Create a label if it doesn't already exist in the repository."""
+        try:
+            self.repo.get_label(name)
+        except GithubException:
+            try:
+                self.repo.create_label(name=name, color=color, description=description)
+                logger.info(f"Created label '{name}'")
+            except GithubException as e:
+                logger.warning(f"Could not create label '{name}': {e}")
     
     def extract_flatpak_id_from_issue_title(self, issue_title: str) -> Optional[str]:
         """Extract flatpak ID from issue title."""
@@ -172,10 +184,11 @@ If this is a false positive or the runtime is intentionally pinned to an older v
         if is_popular:
             labels.append("popular")
         
-        # Add runtime version label
+        # Add runtime version label and the catch-all runtime label
         runtime_label = self._get_runtime_label(package.latest_runtime)
         if runtime_label:
             labels.append(runtime_label)
+        labels.append("runtime")
 
         if existing_issue:
             # Update existing issue
@@ -221,6 +234,7 @@ The runtime update instructions remain the same.
                     runtime_label = self._get_runtime_label(package.latest_runtime)
                     if runtime_label:
                         existing_issue.add_to_labels(runtime_label)
+                    existing_issue.add_to_labels("runtime")
                     
                     return True
                 else:
@@ -245,6 +259,33 @@ The runtime update instructions remain the same.
                 logger.error(f"Failed to create issue for {package.flatpak_id}: {e}")
                 return False
     
+    def backfill_runtime_label(self) -> None:
+        """Add the 'runtime' label to all open runtime update issues that are missing it."""
+        logger.info("Backfilling 'runtime' label on existing runtime update issues")
+        updated = 0
+        skipped = 0
+
+        try:
+            open_issues = self.repo.get_issues(state='open')
+            for issue in open_issues:
+                if not self.extract_flatpak_id_from_issue_title(issue.title):
+                    continue
+                existing_label_names = {lbl.name for lbl in issue.labels}
+                if 'runtime' not in existing_label_names:
+                    try:
+                        issue.add_to_labels('runtime')
+                        logger.info(f"Added 'runtime' label to issue #{issue.number}: {issue.title}")
+                        updated += 1
+                    except Exception as e:
+                        logger.error(f"Failed to label issue #{issue.number}: {e}")
+                else:
+                    skipped += 1
+
+        except Exception as e:
+            logger.error(f"Failed to backfill runtime label: {e}")
+
+        logger.info(f"Backfill complete: {updated} issues labeled, {skipped} already had the label")
+
     def close_resolved_issues(self, current_outdated_packages: List[str], all_tracked_packages: List[str]):
         """Close issues for flatpaks that are no longer outdated or no longer tracked."""
         logger.info("Checking for resolved runtime issues to close")
@@ -468,7 +509,10 @@ def main():
     
     # Initialize issue generator
     generator = IssueGenerator(github_token, repo_name)
-    
+
+    # Backfill 'runtime' label on any pre-existing issues that are missing it
+    generator.backfill_runtime_label()
+
     # Close resolved issues first - pass both lists
     current_outdated_flatpak_ids = [pkg.flatpak_id for pkg in packages]
     generator.close_resolved_issues(current_outdated_flatpak_ids, all_tracked_packages)

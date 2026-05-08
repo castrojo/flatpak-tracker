@@ -31,9 +31,27 @@ class FlatpakInfo:
 
 
 class FlatpakRuntimeChecker:
+    # Well-maintained apps that reliably track the latest stable version of each
+    # runtime family. Querying their Flathub metadata tells us the current stable
+    # runtime version without depending on the flatpak CLI or hardcoded constants.
+    RUNTIME_SENTINELS = {
+        'org.gnome.Platform':      ['org.gnome.Calculator', 'org.gnome.Calendar'],
+        'org.kde.Platform':        ['org.kde.kalk', 'org.kde.gwenview'],
+        'org.freedesktop.Platform': ['com.github.tchx84.Flatseal', 'org.videolan.VLC'],
+    }
+
+    # Last-resort fallback versions. Update these when a new stable runtime ships
+    # and Flathub API queries are temporarily unavailable (e.g. network outage).
+    FALLBACK_RUNTIME_VERSIONS = {
+        'org.gnome.Platform':      '49',
+        'org.freedesktop.Platform': '25.08',
+        'org.kde.Platform':        '6.10',
+    }
+
     def __init__(self, output_file: str = None):
         self.flathub_base_url = "https://flathub.org/api/v2/appstream"
         self.output_file = output_file or "outdated_packages.json"
+        self._runtime_version_cache: Dict[str, List[str]] = {}
         
     def fetch_flatpak_list(self) -> Dict[str, FlatpakInfo]:
         """Fetch and merge flatpak lists from multiple ublue-os sources with deduplication."""
@@ -41,12 +59,12 @@ class FlatpakRuntimeChecker:
         # Define all sources with their URLs and formats
         sources = {
             'bluefin': {
-                'url': 'https://raw.githubusercontent.com/ublue-os/bluefin/main/flatpaks/system-flatpaks.list',
-                'format': 'app_prefix'  # already has app/ prefix
+                'url': 'https://raw.githubusercontent.com/projectbluefin/common/main/system_files/bluefin/usr/share/ublue-os/homebrew/system-flatpaks.Brewfile',
+                'format': 'brewfile'  # flatpak "app.id" per line
             },
             'aurora': {
-                'url': 'https://raw.githubusercontent.com/ublue-os/aurora/main/flatpaks/system-flatpaks.list', 
-                'format': 'no_prefix'  # needs app/ prefix added
+                'url': 'https://raw.githubusercontent.com/get-aurora-dev/common/main/system_files/shared/usr/share/ublue-os/homebrew/system-flatpaks.Brewfile',
+                'format': 'brewfile'  # flatpak "app.id" per line
             },
             'bazzite-gnome': {
                 'url': 'https://raw.githubusercontent.com/ublue-os/bazzite/main/installer/gnome_flatpaks/flatpaks',
@@ -56,14 +74,14 @@ class FlatpakRuntimeChecker:
                 'url': 'https://raw.githubusercontent.com/ublue-os/bazzite/main/installer/kde_flatpaks/flatpaks',
                 'format': 'full_ref'  # app/package/arch/branch format
             },
-            # Bazaar config sources
+            # Bazaar curated sources
             'bluefin-bazaar': {
-                'url': 'https://raw.githubusercontent.com/ublue-os/bluefin/main/system_files/shared/etc/bazaar/config.yaml',
-                'format': 'bazaar_yaml'  # YAML format with appids in sections
+                'url': 'https://raw.githubusercontent.com/projectbluefin/common/main/system_files/bluefin/etc/bazaar/curated.yaml',
+                'format': 'curated_yaml'  # YAML with rows -> sections -> category.appids
             },
             'aurora-bazaar': {
-                'url': 'https://raw.githubusercontent.com/ublue-os/aurora/main/system_files/shared/etc/bazaar/config.yaml',
-                'format': 'bazaar_yaml'  # YAML format with appids in sections
+                'url': 'https://raw.githubusercontent.com/get-aurora-dev/common/main/system_files/shared/etc/bazaar/curated.yaml',
+                'format': 'curated_yaml'  # YAML with rows -> sections -> category.appids
             },
             'bazzite-bazaar': {
                 'url': 'https://raw.githubusercontent.com/ublue-os/bazzite/main/system_files/desktop/shared/usr/share/ublue-os/bazaar/config.yaml',
@@ -84,21 +102,20 @@ class FlatpakRuntimeChecker:
                 source_flatpaks = []
                 
                 if source_config['format'] == 'bazaar_yaml':
-                    # Parse YAML and extract appids from all sections
+                    # Parse YAML and extract appids from all sections (bazzite legacy format)
                     source_flatpaks = self._parse_bazaar_yaml(response.text)
+                elif source_config['format'] == 'curated_yaml':
+                    # Parse new bazaar curated.yaml (rows -> sections -> category.appids)
+                    source_flatpaks = self._parse_curated_yaml(response.text)
+                elif source_config['format'] == 'brewfile':
+                    # Parse Brewfile format: flatpak "app.id" per line
+                    source_flatpaks = self._parse_brewfile(response.text)
                 else:
-                    # Handle existing list formats
+                    # Handle plain list formats (full_ref for bazzite)
                     for line in response.text.strip().split('\n'):
                         line = line.strip()
                         if line and not line.startswith('#'):
-                            # Normalize to app/package.id format
-                            if source_config['format'] == 'app_prefix':
-                                # Already correct format: app/package.id
-                                flatpak_id = line
-                            elif source_config['format'] == 'no_prefix':
-                                # Add app/ prefix: package.id -> app/package.id
-                                flatpak_id = f"app/{line}"
-                            elif source_config['format'] == 'full_ref':
+                            if source_config['format'] == 'full_ref':
                                 # Extract package ID: app/package.id/arch/branch -> app/package.id
                                 parts = line.split('/')
                                 if len(parts) >= 2:
@@ -184,6 +201,63 @@ class FlatpakRuntimeChecker:
             logger.error(f"Error processing bazaar YAML: {e}")
             return []
     
+    def _parse_brewfile(self, content: str) -> List[str]:
+        """Parse Brewfile format and extract flatpak app IDs.
+        
+        Handles lines like: flatpak "com.example.App"
+        """
+        flatpaks = []
+        for line in content.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Match: flatpak "app.id"
+            if line.startswith('flatpak '):
+                app_id = line[len('flatpak '):].strip().strip('"\'')
+                if app_id:
+                    flatpaks.append(f"app/{app_id}")
+        logger.debug(f"Parsed {len(flatpaks)} flatpaks from Brewfile")
+        return flatpaks
+
+    def _parse_curated_yaml(self, yaml_content: str) -> List[str]:
+        """Parse new bazaar curated.yaml format and extract all appids.
+        
+        Structure: rows -> sections -> category.appids (list of app IDs without app/ prefix)
+        """
+        try:
+            config = yaml.safe_load(yaml_content)
+            flatpaks = []
+
+            if not isinstance(config, dict) or 'rows' not in config:
+                logger.warning("Unexpected curated.yaml structure: missing 'rows' key")
+                return []
+
+            for row in config['rows']:
+                if not isinstance(row, dict):
+                    continue
+                for section in row.get('sections', []):
+                    if not isinstance(section, dict):
+                        continue
+                    category = section.get('category', {})
+                    if not isinstance(category, dict):
+                        continue
+                    for app_id in category.get('appids', []):
+                        if isinstance(app_id, str) and app_id.strip():
+                            app_id = app_id.strip()
+                            if not app_id.startswith('app/'):
+                                app_id = f"app/{app_id}"
+                            flatpaks.append(app_id)
+
+            logger.debug(f"Parsed {len(flatpaks)} flatpaks from curated YAML")
+            return flatpaks
+
+        except yaml.YAMLError as e:
+            logger.error(f"Failed to parse curated YAML: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Error processing curated YAML: {e}")
+            return []
+
     def get_app_flatpaks(self, flatpak_dict: Dict[str, FlatpakInfo]) -> Dict[str, FlatpakInfo]:
         """Filter to get only app flatpaks (not runtimes) - all should already be apps."""
         return {fid: info for fid, info in flatpak_dict.items() if fid.startswith('app/')}
@@ -225,60 +299,80 @@ class FlatpakRuntimeChecker:
             return None
     
     def get_available_runtime_versions(self, runtime_name: str) -> List[str]:
-        """Get available versions of a runtime from flathub using API and known current versions."""
-        
-        # Known current runtime versions as of 2024/2025
-        # These are updated periodically and represent the latest stable versions
-        # TODO: Update these versions when new stable releases are available
-        # - Check GNOME release schedule: https://wiki.gnome.org/ReleasePlanning
-        # - Check Freedesktop SDK releases: https://gitlab.com/freedesktop-sdk/freedesktop-sdk
-        # - Check KDE release schedule: https://community.kde.org/Schedules
-        known_latest_versions = {
-            'org.gnome.Platform': '49',  # GNOME 49 is current stable as of Oct 2025
-            'org.freedesktop.Platform': '25.08',  # Freedesktop 25.08 is current
-            'org.kde.Platform': '6.10',  # KDE 6.9 is current
-        }
-        
-        # First, try to use the known latest version for common runtimes
-        if runtime_name in known_latest_versions:
-            latest_version = known_latest_versions[runtime_name]
-            logger.info(f"Using known latest version {latest_version} for runtime {runtime_name}")
-            return [latest_version]
-        
-        # Fallback: try to get runtime information from Flathub API
-        try:
-            api_url = f"https://flathub.org/api/v2/appstream/{runtime_name}"
-            response = requests.get(api_url, timeout=30)
-            if response.status_code == 200:
-                runtime_info = response.json()
-                # Try to extract version information from the API response
-                if 'bundle' in runtime_info and 'runtime' in runtime_info['bundle']:
-                    runtime_ref = runtime_info['bundle']['runtime']
-                    # Extract version from runtime reference (e.g., "org.gnome.Platform/x86_64/47" -> "47")
-                    if '/' in runtime_ref:
-                        version = runtime_ref.split('/')[-1]
-                        return [version]
-        except requests.RequestException as e:
-            logger.debug(f"Could not fetch runtime info from API for {runtime_name}: {e}")
-        
-        # Final fallback: try flatpak command (kept for environments where it might work)
+        """Get the latest version of a runtime, querying Flathub first.
+
+        Strategy:
+          1. Return cached result if already resolved this session.
+          2. Query sentinel apps on Flathub — apps that are actively maintained
+             and always updated to the latest stable runtime. Extract the runtime
+             version they declare and take the maximum across all sentinels.
+          3. Try the local flatpak CLI (works when flathub remote is configured).
+          4. Fall back to FALLBACK_RUNTIME_VERSIONS (hardcoded safety net).
+        """
+        if runtime_name in self._runtime_version_cache:
+            return self._runtime_version_cache[runtime_name]
+
+        # --- Tier 1: sentinel apps via Flathub API ---
+        sentinel_apps = self.RUNTIME_SENTINELS.get(runtime_name, [])
+        versions_found = []
+
+        for app_id in sentinel_apps:
+            try:
+                response = requests.get(f"{self.flathub_base_url}/{app_id}", timeout=30)
+                if response.status_code != 200:
+                    continue
+                app_info = response.json()
+                runtime_ref = None
+                if 'bundle' in app_info and 'runtime' in app_info['bundle']:
+                    runtime_ref = app_info['bundle']['runtime']
+                elif 'metadata' in app_info and 'runtime' in app_info['metadata']:
+                    runtime_ref = app_info['metadata']['runtime']
+
+                if runtime_ref:
+                    # runtime_ref looks like "org.gnome.Platform/x86_64/49"
+                    ref_parts = runtime_ref.split('/')
+                    if len(ref_parts) >= 3 and ref_parts[0] == runtime_name:
+                        versions_found.append(ref_parts[2])
+                        logger.info(f"Detected {runtime_name} {ref_parts[2]} from sentinel {app_id}")
+                        break  # One confirmed answer is enough
+            except requests.RequestException as e:
+                logger.debug(f"Could not query sentinel app {app_id}: {e}")
+
+        if versions_found:
+            latest = max(versions_found, key=lambda v: [int(x) for x in v.replace('-', '.').split('.') if x.isdigit()] or [0])
+            result = [latest]
+            self._runtime_version_cache[runtime_name] = result
+            return result
+
+        # --- Tier 2: local flatpak CLI ---
         try:
             cmd = ['flatpak', 'remote-ls', '--runtime', 'flathub', '--columns=name,version', runtime_name]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode == 0:
+            result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result_proc.returncode == 0:
                 versions = []
-                for line in result.stdout.strip().split('\n'):
+                for line in result_proc.stdout.strip().split('\n'):
                     if line.strip():
                         parts = line.split('\t')
                         if len(parts) >= 2 and parts[0].strip() == runtime_name:
                             versions.append(parts[1].strip())
                 if versions:
+                    self._runtime_version_cache[runtime_name] = versions
                     return versions
-                    
         except Exception as e:
             logger.debug(f"Flatpak command failed for {runtime_name}: {e}")
-            
+
+        # --- Tier 3: hardcoded fallback ---
+        if runtime_name in self.FALLBACK_RUNTIME_VERSIONS:
+            fallback = self.FALLBACK_RUNTIME_VERSIONS[runtime_name]
+            logger.warning(
+                f"All dynamic lookups failed for {runtime_name}; "
+                f"using hardcoded fallback version {fallback}. "
+                f"Update FALLBACK_RUNTIME_VERSIONS if this is stale."
+            )
+            result = [fallback]
+            self._runtime_version_cache[runtime_name] = result
+            return result
+
         logger.warning(f"Could not determine latest version for runtime {runtime_name}")
         return []
     

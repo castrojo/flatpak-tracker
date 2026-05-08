@@ -347,6 +347,8 @@ To test the full orchestration:
 - Issues for applications that need to upgrade to org.gnome.Platform/x86_64/49 should be labeled as `gnome-49`
 - Issues for applications that need their freedesktop runtime updated to org.freedesktop.Platform/x86_64/25.08 should be labeled `freedesktop-25.08`
 - Issues for applications that need their KDE runtime updated to org.kde.Platform/x86_64/6.9 should be labeled `kde-6.9`
+- **All** runtime update issues (GNOME, KDE, and Freedesktop) are also labeled with `runtime` — this is a catch-all label for filtering any runtime update regardless of family
+- The `runtime` label is created automatically on first run via `_ensure_label` in `IssueGenerator.__init__`
 
 ## Popular Application Labels
 - The `popular` label is automatically applied to the **top 10 most downloaded applications** within each runtime group
@@ -369,7 +371,8 @@ To test the full orchestration:
 - Existing issues for filtered apps are automatically closed when filtering rules are applied
 
 ## Label Purpose
-- Runtime version labels help filter issues by target runtime
+- Runtime version labels (`gnome-49`, `freedesktop-25.08`, `kde-6.10`) help filter issues by target runtime family/version
+- `runtime` label is applied to **every** runtime update issue as a catch-all across all runtime families
 - `popular` label helps prioritize high-impact applications that affect more users
 - `donation-metadata` label separates donation-related issues from runtime updates
 
